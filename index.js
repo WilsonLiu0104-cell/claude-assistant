@@ -43,37 +43,41 @@ function clearHistory(cid) {
 // ─── Claude ──────────────────────────────────────────────
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 
-// 专门用来解析自然语言时间的 prompt
-async function parseReminderIntent(text, nowIso) {
+// 第一步：专门判断是否有提醒意图，完全独立于对话历史
+async function parseReminderIntent(text, nowStr) {
   const res = await claude.messages.create({
     model: 'claude-opus-4-5',
     max_tokens: 300,
-    system: `你是一个时间解析助手。当前时间（Asia/Shanghai）：${nowIso}
-用户输入一句话，你判断是否包含"提醒"意图。
-如果是，返回 JSON（只返回 JSON，不加任何说明）：
+    system: `你是时间解析助手。当前时间（Asia/Shanghai）：${nowStr}
+判断用户输入是否包含"提醒"意图。只返回 JSON，不加任何说明。
+
+有提醒意图时返回：
 {
   "isReminder": true,
-  "reminderText": "提醒内容（简短）",
-  "fireAtISO": "触发时间的 ISO8601 字符串，Asia/Shanghai 时区",
-  "repeatCron": "如果是每日/每周重复，填 cron 表达式（Asia/Shanghai），否则填 null"
+  "reminderText": "提醒内容（简短动词短语）",
+  "fireAtISO": "触发时间 ISO8601，Asia/Shanghai 时区",
+  "repeatCron": "循环时填 cron 表达式，否则填 null"
 }
-如果不是提醒意图，返回：{"isReminder": false}
 
-示例：
-- "下午3点提醒我开会" → fireAtISO 为今天15:00，repeatCron: null
-- "每天早上9点提醒我喝水" → fireAtISO 为明天09:00，repeatCron: "0 9 * * *"
-- "30分钟后提醒我回邮件" → fireAtISO 为30分钟后，repeatCron: null
-- "明天上午10点提醒我打电话给王总" → 明天10:00，repeatCron: null`,
+无提醒意图时返回：{"isReminder": false}
+
+例子：
+- "每天晚上11点提醒我洗澡" → isReminder:true, repeatCron:"0 23 * * *"
+- "30分钟后提醒我喝水" → isReminder:true, repeatCron:null
+- "明天下午3点提醒我开会" → isReminder:true, repeatCron:null
+- "每周一早上提醒我写周报" → isReminder:true, repeatCron:"0 9 * * 1"
+- "今天天气怎么样" → isReminder:false`,
     messages: [{ role: 'user', content: text }],
   });
   try {
-    return JSON.parse(res.content[0].text.trim());
+    const raw = res.content[0].text.trim().replace(/```json|```/g, '');
+    return JSON.parse(raw);
   } catch {
     return { isReminder: false };
   }
 }
 
-// 普通对话
+// 第二步：普通对话（已确认不是提醒意图才进入）
 async function askClaude(cid, userMessage) {
   saveMessage(cid, 'user', userMessage);
   const history = getHistory(cid, 20);
@@ -81,7 +85,10 @@ async function askClaude(cid, userMessage) {
   const res = await claude.messages.create({
     model: 'claude-opus-4-5',
     max_tokens: 1024,
-    system: `你是一个高效的个人助手，运行在 Slack 里。回答简洁，善用 Slack markdown（*粗体*、_斜体_、\`代码\`）。当前时间：${now}`,
+    system: `你是一个高效的个人助手，运行在 Slack 里。
+能力说明：你已经集成了提醒系统，用户说任何包含时间+提醒的句子都会被自动处理为定时提醒并在指定时间主动推送消息。
+回答简洁，善用 Slack markdown（*粗体*、_斜体_、\`代码\`）。
+当前时间：${now}`,
     messages: history,
   });
   const reply = res.content[0].text;
@@ -105,19 +112,18 @@ function fireReminder(channelId, userId, message) {
 
 function scheduleReminder(row) {
   const { id, channel_id, user_id, message, fire_at, repeat_cron } = row;
-  const delay = fire_at - Date.now();
-
   if (repeat_cron) {
-    // 每日/每周循环
     cron.schedule(repeat_cron, () => fireReminder(channel_id, user_id, message), { timezone: 'Asia/Shanghai' });
-    console.log(`🔁 循环提醒已恢复 [${id}]: ${repeat_cron} → ${message}`);
-  } else if (delay > 0) {
-    // 一次性
-    setTimeout(() => {
-      fireReminder(channel_id, user_id, message);
-      db.prepare(`UPDATE reminders SET active = 0 WHERE id = ?`).run(id);
-    }, delay);
-    console.log(`⏰ 一次性提醒已恢复 [${id}]: ${new Date(fire_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} → ${message}`);
+    console.log(`🔁 循环提醒 [${id}]: ${repeat_cron} → ${message}`);
+  } else {
+    const delay = fire_at - Date.now();
+    if (delay > 0) {
+      setTimeout(() => {
+        fireReminder(channel_id, user_id, message);
+        db.prepare(`UPDATE reminders SET active = 0 WHERE id = ?`).run(id);
+      }, delay);
+      console.log(`⏰ 一次性提醒 [${id}]: ${new Date(fire_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai' })} → ${message}`);
+    }
   }
 }
 
@@ -126,7 +132,6 @@ function addReminder({ channelId, userId, message, fireAtISO, repeatCron }) {
   const result = db.prepare(
     `INSERT INTO reminders (channel_id, user_id, message, fire_at, repeat_cron) VALUES (?, ?, ?, ?, ?)`
   ).run(channelId, userId, message, fireAt, repeatCron || null);
-
   scheduleReminder({ id: result.lastInsertRowid, channel_id: channelId, user_id: userId, message, fire_at: fireAt, repeat_cron: repeatCron || null });
   return fireAt;
 }
@@ -139,39 +144,45 @@ function restoreReminders() {
 
 // ─── 消息处理核心 ─────────────────────────────────────────
 async function handleMessage(text, channelId, userId, replyFn) {
-  const now = new Date().toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false });
+  const now = new Date().toLocaleString('zh-CN', {
+    timeZone: 'Asia/Shanghai', hour12: false,
+    year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit',
+  });
 
-  // 先用 Claude 判断是否是提醒意图
-  const intent = await parseReminderIntent(text, now);
+  // 提醒意图检测优先，完全独立于对话历史
+  let intent;
+  try {
+    intent = await parseReminderIntent(text, now);
+  } catch (e) {
+    console.error('提醒解析失败', e);
+    intent = { isReminder: false };
+  }
 
   if (intent.isReminder && intent.fireAtISO) {
     const fireAt = addReminder({
-      channelId,
-      userId,
+      channelId, userId,
       message: intent.reminderText,
       fireAtISO: intent.fireAtISO,
       repeatCron: intent.repeatCron,
     });
-
     const fireTime = new Date(fireAt).toLocaleString('zh-CN', {
       timeZone: 'Asia/Shanghai',
       month: 'long', day: 'numeric',
       hour: '2-digit', minute: '2-digit',
     });
-
-    const repeatHint = intent.repeatCron ? '（每日重复）' : '';
-    await replyFn(`✅ 提醒已设置${repeatHint}\n*时间：* ${fireTime}\n*内容：* ${intent.reminderText}`);
+    const repeatHint = intent.repeatCron ? '（每日重复 🔁）' : '（一次性）';
+    await replyFn(`✅ 提醒已设置 ${repeatHint}\n*时间：* ${fireTime}\n*内容：* ${intent.reminderText}`);
     return;
   }
 
-  // 普通对话
+  // 非提醒意图，走普通对话
   const reply = await askClaude(`dm_${userId}`, text);
   await replyFn(reply);
 }
 
 // ─── 事件监听 ─────────────────────────────────────────────
 
-// 频道 @mention
 app.event('app_mention', async ({ event, say }) => {
   const text = event.text.replace(/<@[A-Z0-9]+>/g, '').trim();
   try {
@@ -182,7 +193,6 @@ app.event('app_mention', async ({ event, say }) => {
   }
 });
 
-// 私信（DM）
 app.message(async ({ message, say }) => {
   if (message.channel_type !== 'im' || message.bot_id) return;
   try {
@@ -193,7 +203,6 @@ app.message(async ({ message, say }) => {
   }
 });
 
-// /claude 斜杠命令
 app.command('/claude', async ({ command, ack, say }) => {
   await ack();
   const text = command.text.trim();
